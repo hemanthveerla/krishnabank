@@ -1,0 +1,226 @@
+pipeline {
+    agent any
+
+    environment {
+
+        GIT_URL        = 'https://github.com/krishnadekrin/krishnabank.git'
+        BRANCH_NAME    = 'main'
+
+        APP_NAME       = 'krishnabank'
+        WAR_FILE       = 'krishnabank.war'
+
+        SONAR_URL      = 'http://13.233.143.58:9000'
+        SONAR_TOKEN    = 'sqp_6af1484e8f5808f17b87e4cea9854b796aa7c2b4'
+
+        IMAGE_NAME     = 'krishnabank-image'
+        CONTAINER_NAME = 'krishnabank-container'
+
+        S3_BUCKET      = 'corpbankartifact'
+        AWS_REGION     = 'ap-south-1'
+    }
+
+    stages {
+
+        stage('Workspace Cleanup') {
+            steps {
+                echo "Cleaning workspace..."
+                deleteDir()
+            }
+        }
+
+        stage('GitHub Checkout') {
+            steps {
+
+                echo "Pulling source code from GitHub..."
+
+                git branch: "${BRANCH_NAME}",
+                url: "${GIT_URL}"
+            }
+        }
+
+        stage('Check Maven') {
+            steps {
+
+                echo "Checking Maven..."
+
+                sh 'mvn -version'
+            }
+        }
+
+        stage('Build WAR Artifact') {
+            steps {
+
+                echo "Building WAR file..."
+
+                sh '''
+                mvn clean package
+                '''
+            }
+        }
+
+        stage('Verify WAR Artifact') {
+            steps {
+
+                echo "Checking WAR artifact..."
+
+                sh '''
+                if ls target/*.war 1> /dev/null 2>&1; then
+                    echo "WAR artifact created successfully"
+                else
+                    echo "WAR artifact creation failed"
+                    exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('SonarQube Code Scan') {
+            steps {
+
+                echo "Running SonarQube scan..."
+
+                sh """
+                mvn clean verify sonar:sonar \
+                -Dsonar.projectKey=test1 \
+                -Dsonar.projectName='test1' \
+                -Dsonar.host.url=${SONAR_URL} \
+                -Dsonar.token=${SONAR_TOKEN}
+                """
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+
+                echo "Creating Docker image..."
+
+                sh '''
+                docker build -t $IMAGE_NAME .
+                '''
+            }
+        }
+
+        stage('Save Docker Image') {
+            steps {
+
+                echo "Saving Docker image as tar file..."
+
+                sh '''
+                docker save -o ${IMAGE_NAME}.tar ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Upload Image To S3') {
+            steps {
+
+                echo "Uploading Docker image to S3..."
+
+                withCredentials([usernamePassword(
+                    credentialsId: 's3-cred',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+
+                    sh '''
+                    aws s3 cp ${IMAGE_NAME}.tar s3://${S3_BUCKET}/ --region ${AWS_REGION}
+
+                    if [ $? -eq 0 ]; then
+                        echo "Docker image uploaded successfully to S3"
+                    else
+                        echo "Docker image upload failed"
+                        exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Remove Existing Container') {
+            steps {
+
+                echo "Removing old Docker container..."
+
+                sh '''
+                docker rm -f ${CONTAINER_NAME} || true
+                '''
+            }
+        }
+
+        stage('Remove Existing Image') {
+            steps {
+
+                echo "Removing existing Docker image..."
+
+                sh '''
+                docker rmi -f ${IMAGE_NAME} || true
+                '''
+            }
+        }
+
+        stage('Download Image From S3') {
+            steps {
+
+                echo "Downloading Docker image from S3..."
+
+                withCredentials([usernamePassword(
+                    credentialsId: 's3-cred',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+
+                    sh '''
+                    aws s3 cp s3://${S3_BUCKET}/${IMAGE_NAME}.tar . --region ${AWS_REGION}
+                    '''
+                }
+            }
+        }
+
+        stage('Load Docker Image') {
+            steps {
+
+                echo "Loading Docker image..."
+
+                sh '''
+                docker load -i ${IMAGE_NAME}.tar
+                '''
+            }
+        }
+
+        stage('Deploy Docker Container') {
+            steps {
+
+                echo "Deploying Docker container..."
+
+                sh '''
+                docker run -d \
+                --name ${CONTAINER_NAME} \
+                -p 8081:8080 \
+                ${IMAGE_NAME}
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+
+                echo "Checking running containers..."
+
+                sh '''
+                docker ps
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "Pipeline executed successfully"
+        }
+
+        failure {
+            echo "Pipeline failed"
+        }
+    }
+}

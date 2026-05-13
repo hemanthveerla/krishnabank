@@ -1,0 +1,205 @@
+pipeline {
+    agent any
+
+    environment {
+
+        GIT_URL        = 'https://github.com/krishnadekrin/krishnabank.git'
+        BRANCH_NAME    = 'main'
+
+        APP_NAME       = 'krishnabank'
+        WAR_FILE       = 'krishnabank.war'
+
+        AWS_REGION     = 'ap-south-1'
+        S3_BUCKET      = 'bankartifact'
+
+        IMAGE_NAME     = 'krishnabank-image'
+        CONTAINER_NAME = 'krishnabank-container'
+    }
+
+    stages {
+
+        stage('Check Maven') {
+            steps {
+                sh 'mvn -version'
+            }
+        }
+
+        stage('Check Docker') {
+            steps {
+                sh 'docker --version'
+                sh 'docker ps'
+            }
+        }
+
+        stage('Code Checkout') {
+            steps {
+
+                echo "Pulling code from GitHub..."
+
+                git branch: "${BRANCH_NAME}",
+                url: "${GIT_URL}"
+            }
+        }
+
+        stage('Build WAR Artifact') {
+            steps {
+
+                echo "Building WAR file..."
+
+                sh '''
+                mvn clean package
+                '''
+            }
+        }
+
+        stage('Verify WAR File') {
+            steps {
+
+                sh '''
+                echo "Checking WAR file..."
+
+                ls -lrt target/
+
+                if ls target/*.war 1> /dev/null 2>&1; then
+                    echo "WAR file created successfully"
+                else
+                    echo "WAR file creation failed"
+                    exit 1
+                fi
+                '''
+            }
+        }
+
+        stage('Upload Artifact to S3') {
+            steps {
+
+                withCredentials([usernamePassword(
+                    credentialsId: 's3-cred',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+
+                    sh '''
+                    echo "Uploading artifact to S3..."
+
+                    aws s3 cp target/$WAR_FILE s3://$S3_BUCKET/ --region $AWS_REGION
+
+                    if [ $? -eq 0 ]; then
+                        echo "Artifact uploaded successfully to S3"
+                    else
+                        echo "Artifact upload failed"
+                        exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Download Artifact from S3') {
+            steps {
+
+                withCredentials([usernamePassword(
+                    credentialsId: 's3-cred',
+                    usernameVariable: 'AWS_ACCESS_KEY_ID',
+                    passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                )]) {
+
+                    sh '''
+                    echo "Downloading artifact from S3..."
+
+                    mkdir -p deploy
+
+                    aws s3 cp s3://$S3_BUCKET/$WAR_FILE deploy/ --region $AWS_REGION
+
+                    if [ $? -eq 0 ]; then
+                        echo "Artifact downloaded successfully"
+                        ls -lrt deploy/
+                    else
+                        echo "Artifact download failed"
+                        exit 1
+                    fi
+                    '''
+                }
+            }
+        }
+
+        stage('Create Dockerfile') {
+            steps {
+
+                sh '''
+                echo "Creating Dockerfile..."
+
+                cat > Dockerfile <<EOF
+FROM tomcat:9-jdk11
+
+RUN rm -rf /usr/local/tomcat/webapps/*
+
+COPY deploy/$WAR_FILE /usr/local/tomcat/webapps/
+
+EXPOSE 8080
+EOF
+                '''
+
+                sh 'cat Dockerfile'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+
+                sh '''
+                echo "Building Docker image..."
+
+                docker build -t $IMAGE_NAME .
+                '''
+            }
+        }
+
+        stage('Remove Old Container') {
+            steps {
+
+                sh '''
+                docker rm -f $CONTAINER_NAME || true
+                '''
+            }
+        }
+
+        stage('Run Docker Container') {
+            steps {
+
+                sh '''
+                echo "Starting Docker container..."
+
+                docker run -d \
+                --name $CONTAINER_NAME \
+                -p 9091:8080 \
+                $IMAGE_NAME
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+
+                sh '''
+                echo "Running Containers:"
+                docker ps
+
+                echo "Application URL:"
+                echo "http://<JENKINS_SERVER_IP>:9090/$APP_NAME"
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo "Pipeline completed successfully"
+        }
+
+        failure {
+            echo "Pipeline failed"
+        }
+    }
+}
